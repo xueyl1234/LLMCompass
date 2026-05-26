@@ -67,13 +67,14 @@ class Softmax(Operator):
         self.computational_graph.data_type = pcb_module.compute_module.core.vector_unit.data_type
         min_cycle_count = float("inf")
         best_mapping = None
+        # 将输入张量映射为 M * N 的二维矩阵，其中每行都做softmax，一共做M次softmax
         M = self.computational_graph.M
         N = self.computational_graph.N
         data_type = self.computational_graph.data_type
         l2_tile_N = N
         l2_tile_M = (
             pcb_module.compute_module.l2_size // (l2_tile_N * data_type.word_size)
-        )
+        ) # l2能放下的矩阵的行数，即单次缓存l2可以做的softmax的次数
         l2_tile_M = min(l2_tile_M, M)
         is_l2_double_buffering = False
         for l1_N_tiling_factor in [1, 2, 4, 8, 16, 32]:
@@ -137,7 +138,7 @@ class Softmax(Operator):
         M_l2_t = M // l2_tile_M
         M_remain = M % l2_tile_M
 
-        l2_tiles = np.empty([ceil(M / l2_tile_M)], dtype=self.L2TileSimulator)
+        l2_tiles = np.empty([ceil(M / l2_tile_M)], dtype=self.L2TileSimulator) # l2_tiles用来存放每个l2 tile的模拟结果的数组
 
         if M_l2_t != 0:
             l2_tiles[:M_l2_t] = self.L2TileSimulator(
@@ -172,7 +173,7 @@ class Softmax(Operator):
             data_type: DataType,
             mapping: "Softmax.Mapping",
             pcb_module: Device,
-        ):
+        ): # 注意，此处的M，N是指这个L2 tile的shape，而不是整个输入的shape，这里的M，N只是变量名与之前的computational_graph.M、computational_graph.N重复而已
             self.M = M
             self.N = N
             self.read_cycle_count = self.simulate_l2_tile_io_cycle_count(
@@ -227,7 +228,7 @@ class Softmax(Operator):
             ) * (
                 l1_tile_cycle_count
                 + log2(ceil(N / l1_tile_N)) * l1_tile.reduction_cycle_count
-            )
+            ) # 第一项是轮次向上取整再加1（保守起见），第二项是每个l1 tile的计算周期加上每个l1 tile的reduction周期乘以reduction的轮数（reduction的轮数等于log2(ceil(N / l1_tile_N))，因为每轮reduction可以把当前的元素数量减半）
             return total_cycle_count
 
 
@@ -239,7 +240,7 @@ class Softmax(Operator):
             data_type: DataType,
             mapping: "Softmax.Mapping",
             pcb_module: Device,
-        ):
+        ): # 注意，与上面相同，此处的M，N是指这个L1 tile的shape
             self.M = M
             self.N = N
             self.flops_per_exp = (
@@ -285,7 +286,7 @@ class Softmax(Operator):
             pcb_module: Device,
         ):
             # online softmax
-            total_flop_count = M * N * (self.flops_per_exp * 3 + 7)
+            total_flop_count = M * N * (self.flops_per_exp * 3 + 7) # 经验公式，粗略估计
             return ceil(
                 total_flop_count
                 / pcb_module.compute_module.core.vector_unit.total_vector_flops_per_cycle

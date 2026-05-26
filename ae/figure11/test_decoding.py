@@ -8,6 +8,13 @@ from multiprocessing import Process, Lock
 from cost_model.cost_model import calc_compute_chiplet_area_mm2, calc_io_die_area_mm2
 import time
 
+import multiprocessing as mp
+
+try:
+    mp.set_start_method("fork")
+except RuntimeError:
+    pass
+
 A100_specs = read_architecture_template("configs/GA100.json")
 A100_system = template_to_system(A100_specs)
 our_specs = read_architecture_template("configs/latency_design.json")

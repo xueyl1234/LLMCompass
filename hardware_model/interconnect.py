@@ -10,12 +10,12 @@ class TopologyType(Enum):
 class LinkModule:
     def __init__(
         self,
-        bandwidth_per_direction: float,  # B/s
-        bandwidth_both_direction: float,  # B/s
-        latency: float,  # s
-        flit_size: int,  # B
-        max_payload_size: int,  # B
-        header_size: int,  # B
+        bandwidth_per_direction: float,  # B/s。单向带宽
+        bandwidth_both_direction: float,  # B/s。双向带宽
+        latency: float,  # s。链路固定时延
+        flit_size: int,  # B。链路最小传输粒度
+        max_payload_size: int,  # B。单个packet能装载的最大有效数据
+        header_size: int,  # B。packet的头部开销
     ) -> None:
         self.bandwidth_per_direction = bandwidth_per_direction
         self.bandwidth_both_direction = bandwidth_both_direction

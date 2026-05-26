@@ -74,7 +74,7 @@ if __name__ == "__main__":
             A100_system = system_dict["A100_4_fp16"]
             _ = model(
                 Tensor([bs, 1, 12288], data_type_dict["fp16"]), s + output_token_length
-            )
+            ) # _是占位符，表示输出结果并不需要。model()调用model的__call__方法，执行前向传播，得到输出结果，但这里我们不关心输出结果，所以用_来接收。
             if args.roofline:
                 model.roofline_model(A100_system)
                 file_name = "transformerAR_A100_roofline.csv"

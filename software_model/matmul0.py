@@ -1,168 +1,38 @@
-from utils import size
-from typing import List, Tuple
+import os
+import sys
+
+# Allow running this file directly: `python software_model/matmul0.py`.
+if __package__ is None or __package__ == "":
+    _repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    if _repo_root not in sys.path:
+        sys.path.insert(0, _repo_root)
+
 from hardware_model.device import Device
 from software_model.operators import Operator
-from software_model.utils import Tensor, DataType
+from software_model.utils import DataType, data_type_dict
 from math import ceil, log2, floor
-import torch
 import time
-import statistics
 import numpy as np
 import pandas as pd
-import os
 from scalesim.scale_sim import scalesim
 import copy
 
 
-class BatchedMatmul(Operator):
-    def __init__(self, data_type: DataType):
-        super().__init__(0, 0, 0, 0, data_type)
-        self.input1_shape = None
-        self.input2_shape = None
-        self.output_shape = None
-
-    def __call__(self, input1: Tensor, input2: Tensor) -> Tensor:
-        # [b, M, K] * [b, K, N] = [b, M, N]
-        assert self.data_type == input1.data_type
-        assert self.data_type == input2.data_type
-        self.input1_shape = input1.shape
-        self.input2_shape = input2.shape
-        assert size(self.input1_shape[:-2]) == size(self.input2_shape[:-2])
-        self.bs = size(self.input1_shape[:-2])
-        self.M = self.input1_shape[-2]
-        self.K = self.input1_shape[-1]
-        assert self.input2_shape[-2] == self.K
-        self.N = self.input2_shape[-1]
-        self.output_shape = self.input1_shape[:-2] + [self.M, self.N]
-        output = Tensor(self.output_shape, self.data_type)
-        return output
-
-    def roofline_model(self, pcb_module: Device):
-        # 复用单次matmul的roofline并乘batch
-        matmul = Matmul(self.data_type)
-        _ = matmul(Tensor([self.M, self.K]), Tensor([self.K, self.N]))
-        matmul_latency = matmul.roofline_model(pcb_module)
-        self.roofline_latency = matmul_latency * self.bs
-        return self.roofline_latency
-
-    # def compile_and_simulate(self, pcb_module: Device, compile_mode: str):
-    #     matmul = Matmul(self.data_type)
-    #     _ = matmul(Tensor([self.M, self.K]), Tensor([self.K, self.N]))
-    #     matmul_latency = (
-    #         matmul.compile_and_simulate(pcb_module, compile_mode)
-    #         # - pcb_module.io_module.latency * 2
-    #     )
-    #     self.latency = matmul_latency * self.bs  # + pcb_module.io_module.latency * 2
-    #     return self.latency
-
-    def compile_and_simulate(self, pcb_module: Device, compile_mode: str):
-        matmul = Matmul(self.data_type)
-        _ = matmul(Tensor([self.M, self.K]), Tensor([self.K, self.N]))
-        matmul_latency1 = (
-            matmul.compile_and_simulate(pcb_module, compile_mode) * self.bs
-        ) # 方案A：每个batch单独计算，完全流水化，理想情况下latency是单个batch的计算时间乘以batch size。matmul_latency1 = bs * latency of Matmul(M,K,N)
-
-        matmul = Matmul(self.data_type)
-        _ = matmul(
-            Tensor([self.M, self.K * self.bs]), Tensor([self.K * self.bs, self.N])
-        )
-        matmul_latency2 = (
-            matmul.compile_and_simulate(pcb_module, compile_mode)
-            + (self.bs - 1)
-            * self.M
-            * self.N
-            * self.data_type.word_size
-            / pcb_module.io_module.bandwidth
-        ) # 方案B：把batch维度和K维度合并成一个大矩阵，计算一次得到所有batch的结果，计算时间是单次大矩阵乘法的时间加上把结果写回内存的时间（因为结果更大了，所以写回时间也增加了）。latency of Matmul(M, K*bs, N) + IO time of writing output (M*N*bs elements) back to memory
-        self.latency = min(matmul_latency1, matmul_latency2)
-        return self.latency
-
-    def run_on_gpu(
-        self,
-    ):
-        input1 = torch.randn(self.bs, self.M, self.K, dtype=torch.float16).cuda()
-        input2 = torch.randn(self.bs, self.K, self.N, dtype=torch.float16).cuda()
-        latencies = []
-        # warmup
-        for _ in range(3):
-            _ = torch.bmm(input1, input2)
-            torch.cuda.synchronize()
-        for _ in range(self.iterations):
-            start = time.time()
-            output = torch.bmm(input1, input2)
-            torch.cuda.synchronize()
-            end = time.time()
-            latencies.append(end - start)
-
-        self.latency_on_gpu = (
-            statistics.median(latencies)
-            # - self.gpu_kernel_launch_overhead()
-            # - 4e-5
-            # min(latencies) - 8e-6
-        )  # GPU launch kernel overhead and PyTorch overhead
-        return self.latency_on_gpu
-
-    @staticmethod
-    def gpu_kernel_launch_overhead():
-        latencies = []
-        for _ in range(50):
-            a = torch.randn(1, 1, 1, device="cuda")
-            b = torch.randn(1, 1, 1, device="cuda")
-            torch.cuda.synchronize()
-            start = time.time()
-            c = torch.bmm(a, b)
-            torch.cuda.synchronize()
-            end = time.time()
-            latencies.append(end - start)
-        avg_overhead = statistics.median(latencies)
-        # print('GPU kernel launch overhead: ', avg_overhead*1e3, 'ms')
-        # print(latencies)
-        return avg_overhead
-
 
 class Matmul(Operator): # MNK指M*K的矩阵与K*N的矩阵相乘，输出M*N的矩阵。class Matmul(Operator):指复用Operator类的属性和方法，Matmul是Operator的子类，继承了Operator的属性和方法
-    def __init__(self, data_type: DataType):
+    def __init__(self, M: int, K: int, N: int, data_type: DataType):
         super().__init__(0, 0, 0, 0, data_type)
-        self.input1_shape = None
-        self.input2_shape = None
-        self.output_shape = None
+        self.M = M
+        self.K = K
+        self.N = N
+        self.output_shape = [self.M, self.N]
         self.look_up_table = None
         self.best_mapping = None
-
-    def __call__(self, input1: Tensor, input2: Tensor) -> Tensor: # 把两个tensor相乘等效展开为两个矩阵相乘
-        # [bs, M, K] * [K, N] = [bs, M, N]
-        assert self.data_type == input1.data_type
-        assert self.data_type == input2.data_type
-        self.input1_shape = input1.shape
-        self.input2_shape = input2.shape
-        self.M = size(self.input1_shape[:-1])
-        self.K = self.input1_shape[-1]
-        assert self.input2_shape[-2] == self.K
-        self.N = self.input2_shape[-1]
-        if len(self.input1_shape) == 2:
-            self.output_shape = [self.M, self.N]
-        else:
-            self.output_shape = self.input1_shape[:-1] + [self.N]
-        output = Tensor(self.output_shape, self.data_type)
         self.computational_graph = self.ComputationalGraph(
             self.M, self.N, self.K, self.data_type
         )
         self.flop_count = 2 * self.M * self.K * self.N
         self.io_count = self.M * self.K + self.K * self.N + self.M * self.N
-        # print(f'{self.M}, {self.N}, {self.K}')
-        return output
-
-    def roofline_model(self, pcb_module: Device):
-        self.roofline_latency = max(
-            self.flop_count / pcb_module.compute_module.total_systolic_array_flops,
-            self.io_count
-            / min(
-                pcb_module.io_module.bandwidth,
-                pcb_module.compute_module.l2_bandwidth_per_cycle
-                * pcb_module.compute_module.clock_freq,
-            ),
-        )
-        return self.roofline_latency
 
     def print_latency(self):
         print(
@@ -277,7 +147,7 @@ class Matmul(Operator): # MNK指M*K的矩阵与K*N的矩阵相乘，输出M*N的
         self,
         pcb_module: Device,
         compile_mode: str = "exhaustive",
-    ):
+    ) -> int:
         # 搜索最优mapping对应最小cycle
         min_cycle_count = 2**63 - 1
         best_mapping = None
@@ -298,13 +168,19 @@ class Matmul(Operator): # MNK指M*K的矩阵与K*N的矩阵相乘，输出M*N的
                 / pcb_module.compute_module.core_count
                 / pcb_module.compute_module.clock_freq
             )
-            self.latency = max(
-                compute_latency, io_latency
-            )  # + pcb_module.io_module.latency * 2
-            return self.latency
+            self.best_mapping = None
+            self.best_cycle_count = ceil(
+                max(compute_latency, io_latency)
+                * pcb_module.compute_module.clock_freq
+            )
+            self.best_latency = (
+                self.best_cycle_count / pcb_module.compute_module.clock_freq
+            )
+            self.latency = self.best_latency
+            return self.best_cycle_count
         if compile_mode == "exhaustive":
             # exhaustive: 全参数穷举
-            for l2_tile_M_log2 in range(1, ceil(log2(self.computational_graph.M)) + 1):
+            for l2_tile_M_log2 in range(5, ceil(log2(self.computational_graph.M)) + 1):
                 l2_tile_M = 2**l2_tile_M_log2 # l2_tile_M，l2中M的tile size，取2的整数倍次方为了缩减搜索空间
                 for l2_tile_N_log2 in range(
                     5, ceil(log2(self.computational_graph.N)) + 1
@@ -334,7 +210,7 @@ class Matmul(Operator): # MNK指M*K的矩阵与K*N的矩阵相乘，输出M*N的
                             is_l2_double_buffering = True # l2双缓冲判断
                         else:
                             is_l2_double_buffering = False
-                        for l1_tile_M_log2 in range(1, l2_tile_M_log2 + 1):
+                        for l1_tile_M_log2 in range(5, l2_tile_M_log2 + 1):
                             l1_tile_M = 2**l1_tile_M_log2 # 缩小搜索空间
                             for l1_tile_N_log2 in range(5, l2_tile_N_log2 + 1):
                                 l1_tile_N = 2**l1_tile_N_log2 # 缩小搜索空间
@@ -745,7 +621,7 @@ class Matmul(Operator): # MNK指M*K的矩阵与K*N的矩阵相乘，输出M*N的
         self.best_latency = min_cycle_count / pcb_module.compute_module.clock_freq
         self.latency = self.best_latency
         # self.best_mapping.display()
-        return self.latency
+        return self.best_cycle_count
 
     def simulate(
         self,
@@ -755,20 +631,34 @@ class Matmul(Operator): # MNK指M*K的矩阵与K*N的矩阵相乘，输出M*N的
     ) -> int: # 注解，表明返回值是int
         if self.look_up_table is None: # None表示表格未加载，需要初始化读取表格
             # 懒加载脉动阵列查找表
-            self.look_up_table = pd.read_csv(
-                f"./systolic_array_model/look_up_table_{pcb_module.compute_module.core.systolic_array.array_height}_{pcb_module.compute_module.core.systolic_array.array_width}.csv",
-                header=None,
-                names=[
-                    "M",
-                    "N",
-                    "K",
-                    "ArrayHeight",
-                    "ArrayWidth",
-                    "Dataflow",
-                    "cycle_count",
-                    "util_rate",
-                ],
+            column_names = [
+                "M",
+                "N",
+                "K",
+                "ArrayHeight",
+                "ArrayWidth",
+                "Dataflow",
+                "cycle_count",
+                "util_rate",
+            ]
+            lut_path = (
+                f"./systolic_array_model/look_up_table_"
+                f"{pcb_module.compute_module.core.systolic_array.array_height}_"
+                f"{pcb_module.compute_module.core.systolic_array.array_width}.csv"
             )
+            if not os.path.exists(lut_path):
+                os.makedirs(os.path.dirname(lut_path), exist_ok=True)
+                pd.DataFrame(columns=column_names).to_csv(
+                    lut_path, header=False, index=False
+                )
+            try:
+                self.look_up_table = pd.read_csv(
+                    lut_path,
+                    header=None,
+                    names=column_names,
+                )
+            except pd.errors.EmptyDataError:
+                self.look_up_table = pd.DataFrame(columns=column_names)
             self.look_up_table.drop_duplicates(
                 inplace=True,
                 subset=["M", "N", "K", "ArrayHeight", "ArrayWidth", "Dataflow"],
@@ -1491,70 +1381,29 @@ class Matmul(Operator): # MNK指M*K的矩阵与K*N的矩阵相乘，输出M*N的
         # 将阵列周期换算为核心周期
         return ceil(cycle_count / mac_per_clock)
 
-    def run_on_gpu(
-        self,
-    ):
-        # 实测GPU matmul延迟中位数
-        # import subprocess
-        # subprocess.run(['nvidia-smi', '-q', '–d', 'CLOCK'])
-        input1 = torch.randn(
-            self.computational_graph.M,
-            self.computational_graph.K,
-            dtype=torch.bfloat16,
-            device="cuda:0",
-        )
-        input2 = torch.randn(
-            self.computational_graph.K,
-            self.computational_graph.N,
-            dtype=torch.bfloat16,
-            device="cuda:0",
-        )
-        latencies = []
-        input1_dummy = torch.ones(4096, 4096).cuda()
-        input2_dummy = torch.ones(4096, 4096).cuda()
-        # warmup
-        for _ in range(3):
-            torch.matmul(input1_dummy, input2_dummy)
-            torch.cuda.synchronize()
-            time.sleep(1)
-        for _ in range(self.iterations):
-            # x = torch.matmul(input1_dummy, input2_dummy)  # flush the cache
-            # torch.cuda.synchronize()
-            start = time.time()
-            output = torch.matmul(input1, input2)
-            torch.cuda.synchronize()
-            end = time.time()
-            assert list(output.shape) == [
-                self.computational_graph.M,
-                self.computational_graph.N,
-            ]
-            latencies.append(end - start)
-            # time.sleep(1)
 
-        self.latency_on_gpu = (
-            statistics.median(latencies)
-            # min(latencies)
-            # - self.gpu_kernel_launch_overhead()
-            # - 4e-5
-            # min(latencies) - 8e-6
-        )  # GPU launch kernel overhead and PyTorch overhead
-        return self.latency_on_gpu
+def main() -> int:
+    from hardware_model.device import device_dict
 
-    @staticmethod
-    def gpu_kernel_launch_overhead():
-        # 实测单kernel启动开销
-        size = 1
-        latencies = []
-        for _ in range(50):
-            a = torch.randn(size, size, device="cuda")
-            b = torch.randn(size, size, device="cuda")
-            torch.cuda.synchronize()
-            start = time.time()
-            c = torch.matmul(a, b)
-            torch.cuda.synchronize()
-            end = time.time()
-            latencies.append(end - start)
-        avg_overhead = statistics.median(latencies)
-        print("GPU kernel launch overhead: ", avg_overhead * 1e3, "ms")
-        print(latencies)
-        return avg_overhead
+    M, K, N = 128, 256, 512
+    data_type = data_type_dict["fp16"]
+    pcb_module = device_dict["A100_80GB_fp16"]
+
+    matmul = Matmul(M, K, N, data_type)
+    assert matmul.output_shape == [M, N], f"unexpected output shape: {matmul.output_shape}"
+    assert matmul.flop_count == 2 * M * K * N
+    assert matmul.io_count == M * K + K * N + M * N
+
+    simulate_cycle_count = matmul.compile_and_simulate(pcb_module)
+
+    print("Matmul smoke test passed")
+    print(f"M={M}, K={K}, N={N}, dtype={data_type.name}")
+    print(f"output_shape={matmul.output_shape}")
+    print(f"flops={matmul.flop_count}, io_count={matmul.io_count}")
+    print(f"simulate_cycle_count={simulate_cycle_count}")
+    print(f"simulate_latency={matmul.best_latency:.6e}s")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

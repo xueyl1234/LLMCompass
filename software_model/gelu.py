@@ -69,7 +69,7 @@ class GeLU(Operator):
             * pcb_module.compute_module.core.vector_unit.vector_width
             * pcb_module.compute_module.core.vector_unit.vector_count
         )
-        M = ceil(self.computational_graph.M / parallelism) * parallelism
+        M = ceil(self.computational_graph.M / parallelism) * parallelism # 向上取整到并行度的整数倍，以充分利用计算资源，避免计算资源闲置
         data_type = self.computational_graph.data_type
         total_io_count = M * 2 * data_type.word_size
         io_latency = (
@@ -77,10 +77,10 @@ class GeLU(Operator):
             + total_io_count
             / pcb_module.compute_module.l2_bandwidth_per_cycle
             / pcb_module.compute_module.clock_freq
-        )
+        ) # 精简模型，忽略了l1的IO时间
         total_flop_count = M * (
             10 + pcb_module.compute_module.core.vector_unit.flops_per_exp
-        )
+        ) # 经验公式
         compute_latency = (
             total_flop_count
             / pcb_module.compute_module.core.vector_unit.total_vector_flops_per_cycle

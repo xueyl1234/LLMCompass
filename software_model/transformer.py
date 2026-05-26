@@ -69,7 +69,7 @@ class TransformerBlockInitComputationTP(Operator):
         d_h = d // h
 
         # multi-head attention
-        Q = self.Q_proj(X, self.Wq)  # [b, s, d / dev_cnt]
+        Q = self.Q_proj(X, self.Wq)  # [b, s, d / dev_cnt]. 同时对应的 M/K/N、computational_graph 也被写到 self.Q_proj 内部状态里
         assert Q.shape == [b, s, d // dev_cnt]
         K = self.K_proj(X, self.Wk)  # [b, s, d / dev_cnt]
         V = self.V_proj(X, self.Wv)  # [b, s, d / dev_cnt]
@@ -192,7 +192,7 @@ class TransformerBlockInitComputationTP(Operator):
         return self.roofline_latency
 
     def compile_and_simulate(self, system: System, compile_mode: str):
-        device = system.device
+        device = system.device # 与autoregression中的pcb一模一样
         interconnect = system.interconnect
 
         # matmul
@@ -200,7 +200,7 @@ class TransformerBlockInitComputationTP(Operator):
         qkv_latency = 3 * (
             self.Q_proj.compile_and_simulate(device, compile_mode)
             + device.compute_module.overhead.matmul
-        )
+        ) # overhead： 额外开销常数
         print("simulating q_mul_k")
         q_mul_k_latency = (
             self.Q_mul_K.compile_and_simulate(device, compile_mode)
@@ -368,7 +368,7 @@ class TransformerBlockAutoRegressionTP(Operator):
         self.W2 = Tensor([4 * d // device_count, d], data_type)
         # operators per device
         # # multi-head attention
-        self.Q_proj = Matmul(data_type)
+        self.Q_proj = Matmul(data_type) # data_type是传递给__init__的参数，表示这个Matmul操作使用的数据类型，比如fp16或者bf16
         self.K_proj = Matmul(data_type)
         self.V_proj = Matmul(data_type)
         self.Q_reshape = Reshape(data_type)
@@ -549,7 +549,7 @@ class TransformerBlockAutoRegressionTP(Operator):
         return self.roofline_latency
 
     def compile_and_simulate(self, system: System, compile_mode: str):
-        pcb = system.device
+        pcb = system.device # 与init中的device一模一样
         interconnect = system.interconnect
 
         # matmul
@@ -557,27 +557,27 @@ class TransformerBlockAutoRegressionTP(Operator):
         qkv_latency = 3 * (
             self.Q_proj.compile_and_simulate(pcb, compile_mode)
             + pcb.compute_module.overhead.matmul
-        )
+        ) # 生成Q、K、V
         # print("simulating q_mul_k")
         q_mul_k_latency = (
             self.Q_mul_K.compile_and_simulate(pcb, compile_mode)
             + pcb.compute_module.overhead.matmul
-        )
+        ) # 计算注意力分数QK^T
         # print("simulating a_mul_v")
         a_mul_v_latency = (
             self.A_mul_V.compile_and_simulate(pcb, compile_mode)
             + pcb.compute_module.overhead.matmul
-        )
+        ) # 把 softmax 后权重乘以 V，得到上下文向量 AV
         # print("simulating h_matmul0")
         h_matmul0_latency = (
             self.H_matmul0.compile_and_simulate(pcb, compile_mode)
             + pcb.compute_module.overhead.matmul
-        )
+        ) # FFN 1，升维
         # print("simulating h1_matmul1")
         h1_matmul1_latency = (
             self.H_matmul1.compile_and_simulate(pcb, compile_mode)
             + pcb.compute_module.overhead.matmul
-        )
+        ) # FFN 2，降维
         # print("simulating h2_matmul2")
         h2_matmul2_latency = (
             self.H_matmul2.compile_and_simulate(pcb, compile_mode)
@@ -611,10 +611,10 @@ class TransformerBlockAutoRegressionTP(Operator):
             + pcb.compute_module.overhead.gelu
         )
 
-        # allreduce
+        # allreduce，注意这里的allreduce是模拟通信延迟
         if self.device_count > 1:
             allreduce_latency = self.allreduce_mha.simulate(interconnect)
-            allreduce_total_latency = allreduce_latency * 2
+            allreduce_total_latency = allreduce_latency * 2 # 因为有两次allreduce，分别在mha和ffn之后，所以乘以2。简化起见，这里假设两次allreduce的通信延迟相同
         else:
             allreduce_latency = 0
             allreduce_total_latency = 0

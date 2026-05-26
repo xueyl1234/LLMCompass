@@ -8,6 +8,14 @@ from multiprocessing import Process, Lock
 from cost_model.cost_model import calc_compute_chiplet_area_mm2, calc_io_die_area_mm2
 import time
 
+import multiprocessing as mp
+
+try:
+    mp.set_start_method("fork")
+except RuntimeError:
+    pass
+
+
 input_seq_length = 2048
 batch_size = 8
 output_seq_length = 1024

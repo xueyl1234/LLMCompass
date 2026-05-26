@@ -1,168 +1,100 @@
-from utils import size
-from typing import List, Tuple
+import os
+import sys
+
+# Allow running this file directly: `python software_model/matmul0.py`.
+if __package__ is None or __package__ == "":
+    _repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    if _repo_root not in sys.path:
+        sys.path.insert(0, _repo_root)
+
 from hardware_model.device import Device
 from software_model.operators import Operator
-from software_model.utils import Tensor, DataType
+from software_model.utils import DataType, data_type_dict
 from math import ceil, log2, floor
-import torch
+from typing import Literal
 import time
-import statistics
 import numpy as np
 import pandas as pd
-import os
 from scalesim.scale_sim import scalesim
 import copy
 
+MatmulType = Literal["QK", "SV"]
 
 class BatchedMatmul(Operator):
-    def __init__(self, data_type: DataType):
+    def __init__(
+        self,
+        B: int,
+        M: int,
+        K: int,
+        N: int,
+        data_type: DataType,
+        matmul_type: MatmulType,
+    ):
         super().__init__(0, 0, 0, 0, data_type)
-        self.input1_shape = None
-        self.input2_shape = None
-        self.output_shape = None
+        self.B = B
+        self.M = M
+        self.K = K
+        self.N = N
+        if matmul_type not in ("QK", "SV"):
+            raise ValueError(f"Unsupported matmul_type: {matmul_type}")
+        self.matmul_type = matmul_type
 
-    def __call__(self, input1: Tensor, input2: Tensor) -> Tensor:
-        # [b, M, K] * [b, K, N] = [b, M, N]
-        assert self.data_type == input1.data_type
-        assert self.data_type == input2.data_type
-        self.input1_shape = input1.shape
-        self.input2_shape = input2.shape
-        assert size(self.input1_shape[:-2]) == size(self.input2_shape[:-2])
-        self.bs = size(self.input1_shape[:-2])
-        self.M = self.input1_shape[-2]
-        self.K = self.input1_shape[-1]
-        assert self.input2_shape[-2] == self.K
-        self.N = self.input2_shape[-1]
-        self.output_shape = self.input1_shape[:-2] + [self.M, self.N]
-        output = Tensor(self.output_shape, self.data_type)
-        return output
-
-    def roofline_model(self, pcb_module: Device):
-        # 复用单次matmul的roofline并乘batch
-        matmul = Matmul(self.data_type)
-        _ = matmul(Tensor([self.M, self.K]), Tensor([self.K, self.N]))
-        matmul_latency = matmul.roofline_model(pcb_module)
-        self.roofline_latency = matmul_latency * self.bs
-        return self.roofline_latency
-
-    # def compile_and_simulate(self, pcb_module: Device, compile_mode: str):
-    #     matmul = Matmul(self.data_type)
-    #     _ = matmul(Tensor([self.M, self.K]), Tensor([self.K, self.N]))
-    #     matmul_latency = (
-    #         matmul.compile_and_simulate(pcb_module, compile_mode)
-    #         # - pcb_module.io_module.latency * 2
-    #     )
-    #     self.latency = matmul_latency * self.bs  # + pcb_module.io_module.latency * 2
-    #     return self.latency
-
-    def compile_and_simulate(self, pcb_module: Device, compile_mode: str):
-        matmul = Matmul(self.data_type)
-        _ = matmul(Tensor([self.M, self.K]), Tensor([self.K, self.N]))
-        matmul_latency1 = (
-            matmul.compile_and_simulate(pcb_module, compile_mode) * self.bs
+    def compile_and_simulate(self,
+        pcb_module: Device,
+        compile_mode: str = "exhaustive",
+    ) -> int:
+        matmul = Matmul(self.M, self.K, self.N, self.data_type, self.matmul_type)
+        matmul_cycle_count1 = (
+            matmul.compile_and_simulate(pcb_module, compile_mode) * self.B
         ) # 方案A：每个batch单独计算，完全流水化，理想情况下latency是单个batch的计算时间乘以batch size。matmul_latency1 = bs * latency of Matmul(M,K,N)
 
-        matmul = Matmul(self.data_type)
-        _ = matmul(
-            Tensor([self.M, self.K * self.bs]), Tensor([self.K * self.bs, self.N])
+        matmul = Matmul(
+            self.M, self.K * self.B, self.N, self.data_type, self.matmul_type
         )
-        matmul_latency2 = (
+        if self.matmul_type == "QK":
+            output_write_cycle_count = 0 # QK不需要写回最终结果
+        elif self.matmul_type == "SV":
+            output_write_cycle_count = ceil(
+                (self.B - 1)
+                * self.M
+                * self.N
+                * self.data_type.word_size
+                / (
+                    pcb_module.io_module.bandwidth
+                    / pcb_module.compute_module.clock_freq
+                )
+            ) # SV需要写回
+        else:
+            raise ValueError(f"Unsupported matmul_type: {self.matmul_type}")
+        matmul_cycle_count2 = (
             matmul.compile_and_simulate(pcb_module, compile_mode)
-            + (self.bs - 1)
-            * self.M
-            * self.N
-            * self.data_type.word_size
-            / pcb_module.io_module.bandwidth
+            + output_write_cycle_count
         ) # 方案B：把batch维度和K维度合并成一个大矩阵，计算一次得到所有batch的结果，计算时间是单次大矩阵乘法的时间加上把结果写回内存的时间（因为结果更大了，所以写回时间也增加了）。latency of Matmul(M, K*bs, N) + IO time of writing output (M*N*bs elements) back to memory
-        self.latency = min(matmul_latency1, matmul_latency2)
-        return self.latency
-
-    def run_on_gpu(
-        self,
-    ):
-        input1 = torch.randn(self.bs, self.M, self.K, dtype=torch.float16).cuda()
-        input2 = torch.randn(self.bs, self.K, self.N, dtype=torch.float16).cuda()
-        latencies = []
-        # warmup
-        for _ in range(3):
-            _ = torch.bmm(input1, input2)
-            torch.cuda.synchronize()
-        for _ in range(self.iterations):
-            start = time.time()
-            output = torch.bmm(input1, input2)
-            torch.cuda.synchronize()
-            end = time.time()
-            latencies.append(end - start)
-
-        self.latency_on_gpu = (
-            statistics.median(latencies)
-            # - self.gpu_kernel_launch_overhead()
-            # - 4e-5
-            # min(latencies) - 8e-6
-        )  # GPU launch kernel overhead and PyTorch overhead
-        return self.latency_on_gpu
-
-    @staticmethod
-    def gpu_kernel_launch_overhead():
-        latencies = []
-        for _ in range(50):
-            a = torch.randn(1, 1, 1, device="cuda")
-            b = torch.randn(1, 1, 1, device="cuda")
-            torch.cuda.synchronize()
-            start = time.time()
-            c = torch.bmm(a, b)
-            torch.cuda.synchronize()
-            end = time.time()
-            latencies.append(end - start)
-        avg_overhead = statistics.median(latencies)
-        # print('GPU kernel launch overhead: ', avg_overhead*1e3, 'ms')
-        # print(latencies)
-        return avg_overhead
+        self.best_cycle_count = min(matmul_cycle_count1, matmul_cycle_count2)
+        self.best_latency = self.best_cycle_count / pcb_module.compute_module.clock_freq
+        self.latency = self.best_latency
+        return self.best_cycle_count
 
 
 class Matmul(Operator): # MNK指M*K的矩阵与K*N的矩阵相乘，输出M*N的矩阵。class Matmul(Operator):指复用Operator类的属性和方法，Matmul是Operator的子类，继承了Operator的属性和方法
-    def __init__(self, data_type: DataType):
+    def __init__(
+        self, M: int, K: int, N: int, data_type: DataType, matmul_type: MatmulType
+    ):
         super().__init__(0, 0, 0, 0, data_type)
-        self.input1_shape = None
-        self.input2_shape = None
-        self.output_shape = None
+        self.M = M
+        self.K = K
+        self.N = N
+        if matmul_type not in ("QK", "SV"):
+            raise ValueError(f"Unsupported matmul_type: {matmul_type}")
+        self.matmul_type = matmul_type
+        self.output_shape = [self.M, self.N]
         self.look_up_table = None
         self.best_mapping = None
-
-    def __call__(self, input1: Tensor, input2: Tensor) -> Tensor: # 把两个tensor相乘等效展开为两个矩阵相乘
-        # [bs, M, K] * [K, N] = [bs, M, N]
-        assert self.data_type == input1.data_type
-        assert self.data_type == input2.data_type
-        self.input1_shape = input1.shape
-        self.input2_shape = input2.shape
-        self.M = size(self.input1_shape[:-1])
-        self.K = self.input1_shape[-1]
-        assert self.input2_shape[-2] == self.K
-        self.N = self.input2_shape[-1]
-        if len(self.input1_shape) == 2:
-            self.output_shape = [self.M, self.N]
-        else:
-            self.output_shape = self.input1_shape[:-1] + [self.N]
-        output = Tensor(self.output_shape, self.data_type)
         self.computational_graph = self.ComputationalGraph(
             self.M, self.N, self.K, self.data_type
         )
         self.flop_count = 2 * self.M * self.K * self.N
         self.io_count = self.M * self.K + self.K * self.N + self.M * self.N
-        # print(f'{self.M}, {self.N}, {self.K}')
-        return output
-
-    def roofline_model(self, pcb_module: Device):
-        self.roofline_latency = max(
-            self.flop_count / pcb_module.compute_module.total_systolic_array_flops,
-            self.io_count
-            / min(
-                pcb_module.io_module.bandwidth,
-                pcb_module.compute_module.l2_bandwidth_per_cycle
-                * pcb_module.compute_module.clock_freq,
-            ),
-        )
-        return self.roofline_latency
 
     def print_latency(self):
         print(
@@ -171,37 +103,17 @@ class Matmul(Operator): # MNK指M*K的矩阵与K*N的矩阵相乘，输出M*N的
         )
 
     @staticmethod
-    def generate_tile_loops(loop_M: int, loop_N: int, loop_K: int, loop_order: str): # 统一生成 tile 的三重循环顺序
-        assert loop_order in ["mkn", "mnk", "nkm", "nmk", "knm", "kmn"]
+    def generate_tile_loops(loop_M: int, loop_N: int, loop_K: int, loop_order: str): # k必须在最内层循环，为了保证flash attention的正确运行
+        assert loop_order in ["mnk", "nmk"]
         if loop_order == "mnk":
             for m in range(loop_M):
                 for n in range(loop_N):
                     for k in range(loop_K):
                         yield m, n, k
-        elif loop_order == "mkn":
-            for m in range(loop_M):
-                for k in range(loop_K):
-                    for n in range(loop_N):
-                        yield m, n, k
         elif loop_order == "nmk":
             for n in range(loop_N):
                 for m in range(loop_M):
                     for k in range(loop_K):
-                        yield m, n, k
-        elif loop_order == "nkm":
-            for n in range(loop_N):
-                for k in range(loop_K):
-                    for m in range(loop_M):
-                        yield m, n, k
-        elif loop_order == "knm":
-            for k in range(loop_K):
-                for n in range(loop_N):
-                    for m in range(loop_M):
-                        yield m, n, k
-        elif loop_order == "kmn":
-            for k in range(loop_K):
-                for m in range(loop_M):
-                    for n in range(loop_N):
                         yield m, n, k
 
     class ComputationalGraph:
@@ -232,6 +144,7 @@ class Matmul(Operator): # MNK指M*K的矩阵与K*N的矩阵相乘，输出M*N的
             l0_M_tiling_factor: int,
             l0_N_tiling_factor: int,
             l0_K_tiling_factor: int,
+            matmul_type: MatmulType = "QK",
             dataflow: str = "os",
         ):
             self.l2_tile_M = l2_tile_M
@@ -246,6 +159,9 @@ class Matmul(Operator): # MNK指M*K的矩阵与K*N的矩阵相乘，输出M*N的
             self.l0_M_tiling_factor = l0_M_tiling_factor
             self.l0_N_tiling_factor = l0_N_tiling_factor
             self.l0_K_tiling_factor = l0_K_tiling_factor
+            if matmul_type not in ("QK", "SV"):
+                raise ValueError(f"Unsupported matmul_type: {matmul_type}")
+            self.matmul_type = matmul_type
             self.dataflow = dataflow
 
         def display(self):
@@ -277,7 +193,7 @@ class Matmul(Operator): # MNK指M*K的矩阵与K*N的矩阵相乘，输出M*N的
         self,
         pcb_module: Device,
         compile_mode: str = "exhaustive",
-    ):
+    ) -> int:
         # 搜索最优mapping对应最小cycle
         min_cycle_count = 2**63 - 1
         best_mapping = None
@@ -298,10 +214,16 @@ class Matmul(Operator): # MNK指M*K的矩阵与K*N的矩阵相乘，输出M*N的
                 / pcb_module.compute_module.core_count
                 / pcb_module.compute_module.clock_freq
             )
-            self.latency = max(
-                compute_latency, io_latency
-            )  # + pcb_module.io_module.latency * 2
-            return self.latency
+            self.best_mapping = None
+            self.best_cycle_count = ceil(
+                max(compute_latency, io_latency)
+                * pcb_module.compute_module.clock_freq
+            )
+            self.best_latency = (
+                self.best_cycle_count / pcb_module.compute_module.clock_freq
+            )
+            self.latency = self.best_latency
+            return self.best_cycle_count
         if compile_mode == "exhaustive":
             # exhaustive: 全参数穷举
             for l2_tile_M_log2 in range(1, ceil(log2(self.computational_graph.M)) + 1):
@@ -349,22 +271,8 @@ class Matmul(Operator): # MNK指M*K的矩阵与K*N的矩阵相乘，输出M*N的
                                         // 2
                                     ):
                                         continue # l1必须双缓冲，所以将working set size of l1限制在l1大小的1/2
-                                    for l2_loop_order in [
-                                        "mkn",
-                                        "mnk",
-                                        "nkm",
-                                        "nmk",
-                                        "knm",
-                                        "kmn",
-                                    ]:
-                                        for l1_loop_order in [
-                                            "mkn",
-                                            "mnk",
-                                            "nkm",
-                                            "nmk",
-                                            "knm",
-                                            "kmn",
-                                        ]:
+                                    for l2_loop_order in ["mnk", "nmk"]:
+                                        for l1_loop_order in ["mnk", "nmk"]:
                                             for (
                                                 l0_M_tiling_factor,
                                                 l0_N_tiling_factor,
@@ -385,6 +293,7 @@ class Matmul(Operator): # MNK指M*K的矩阵与K*N的矩阵相乘，输出M*N的
                                                     l0_M_tiling_factor,
                                                     l0_N_tiling_factor,
                                                     l0_K_tiling_factor,
+                                                    self.matmul_type,
                                                 )
                                                 cycle_count = self.simulate(
                                                     self.computational_graph,
@@ -468,8 +377,8 @@ class Matmul(Operator): # MNK指M*K的矩阵与K*N的矩阵相乘，输出M*N的
                             // 2
                         ):
                             continue
-                        l2_loop_order = "knm"
-                        l1_loop_order = "knm"
+                        l2_loop_order = "mnk"
+                        l1_loop_order = "mnk"
                         for (
                             l0_M_tiling_factor,
                             l0_N_tiling_factor,
@@ -493,6 +402,7 @@ class Matmul(Operator): # MNK指M*K的矩阵与K*N的矩阵相乘，输出M*N的
                                 l0_M_tiling_factor,
                                 l0_N_tiling_factor,
                                 l0_K_tiling_factor,
+                                self.matmul_type,
                             )
                             cycle_count = self.simulate(
                                 self.computational_graph,
@@ -560,8 +470,8 @@ class Matmul(Operator): # MNK指M*K的矩阵与K*N的矩阵相乘，输出M*N的
                                     // 2
                                 ):
                                     continue
-                                l2_loop_order = "knm"
-                                l1_loop_order = "knm"
+                                l2_loop_order = "mnk"
+                                l1_loop_order = "mnk"
                                 for (
                                     l0_M_tiling_factor,
                                     l0_N_tiling_factor,
@@ -584,6 +494,7 @@ class Matmul(Operator): # MNK指M*K的矩阵与K*N的矩阵相乘，输出M*N的
                                         l0_M_tiling_factor,
                                         l0_N_tiling_factor,
                                         l0_K_tiling_factor,
+                                        self.matmul_type,
                                     )
                                     cycle_count = self.simulate(
                                         self.computational_graph,
@@ -597,144 +508,6 @@ class Matmul(Operator): # MNK指M*K的矩阵与K*N的矩阵相乘，输出M*N的
                                         min_cycle_count = cycle_count
                                         best_mapping = mapping
             # print("total dse times:", i)
-        elif compile_mode == "heuristic-TPU":
-            # heuristic-TPU: TPU经验候选集
-            l2_tile_M = self.computational_graph.M
-            l2_tile_N = self.computational_graph.N
-            l2_tile_K = self.computational_graph.K
-
-            is_l2_double_buffering = True
-            for l1_tile_M in [l2_tile_M, 64, 128, 256, 512, 1024, 2048, 4096, 8192]:
-                if l1_tile_M > l2_tile_M * 2:
-                    continue
-                for l1_tile_N in [
-                    l1_tile_M // 2,
-                    l1_tile_M,
-                    l1_tile_M * 2,
-                    l1_tile_M * 8,
-                    l1_tile_M * 16,
-                    l1_tile_M * 64,
-                    l1_tile_M * 128,
-                    l1_tile_M * 256,
-                ]:
-                    if l1_tile_N > l2_tile_N:
-                        continue
-                    if l1_tile_N <= 0:
-                        continue
-                    l1_tile_K_max = (
-                        pcb_module.compute_module.core.SRAM_size
-                        // self.data_type.word_size
-                        // 2
-                        - l1_tile_M * l1_tile_N
-                    ) // (l1_tile_M + l1_tile_N)
-                    if l1_tile_K_max < 1:
-                        continue
-                    l1_tile_K = min(l1_tile_K_max, l2_tile_K)
-                    l1_tile_K = floor(log2(l1_tile_K))
-                    l1_tile_K = 2**l1_tile_K
-
-                    l2_loop_order = "knm"
-                    l1_loop_order = "knm"
-                    for (
-                        l0_M_tiling_factor,
-                        l0_N_tiling_factor,
-                        l0_K_tiling_factor,
-                    ) in [(1, 2, 1)]:
-                        mapping = self.Mapping(
-                            l2_tile_M,
-                            l2_tile_N,
-                            l2_tile_K,
-                            is_l2_double_buffering,
-                            l1_tile_M,
-                            l1_tile_N,
-                            l1_tile_K,
-                            l2_loop_order,
-                            l1_loop_order,
-                            l0_M_tiling_factor,
-                            l0_N_tiling_factor,
-                            l0_K_tiling_factor,
-                        )
-                        # mapping.display()
-                        # start=time.time()
-                        cycle_count = self.simulate(
-                            self.computational_graph,
-                            mapping,
-                            pcb_module,
-                        )
-                        # end=time.time()
-                        # print(f'simulation time: {end-start}')
-                        if cycle_count < min_cycle_count:
-                            min_cycle_count = cycle_count
-                            best_mapping = mapping
-        elif compile_mode == "heuristic-TPU-new":
-            # heuristic-TPU-new: 新TPU候选集
-            l2_tile_M = self.computational_graph.M
-            l2_tile_N = self.computational_graph.N
-            l2_tile_K = self.computational_graph.K
-
-            is_l2_double_buffering = True
-            for l1_tile_M in [l2_tile_M, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192]:
-                if l1_tile_M > l2_tile_M * 2:
-                    continue
-                for l1_tile_N in [
-                    l1_tile_M // 2,
-                    l1_tile_M,
-                    l1_tile_M * 2,
-                    l1_tile_M * 8,
-                    l1_tile_M * 16,
-                    l1_tile_M * 64,
-                    l1_tile_M * 128,
-                    l1_tile_M * 256,
-                ]:
-                    if l1_tile_N > l2_tile_N:
-                        continue
-                    if l1_tile_N <= 0:
-                        continue
-                    l1_tile_K_max = (
-                        pcb_module.compute_module.core.SRAM_size
-                        // self.data_type.word_size
-                        // 2
-                        - l1_tile_M * l1_tile_N
-                    ) // (l1_tile_M + l1_tile_N)
-                    if l1_tile_K_max < 1:
-                        continue
-                    l1_tile_K = min(l1_tile_K_max, l2_tile_K)
-                    l1_tile_K = floor(log2(l1_tile_K))
-                    l1_tile_K = 2**l1_tile_K
-
-                    l2_loop_order = "knm"
-                    l1_loop_order = "knm"
-                    for (
-                        l0_M_tiling_factor,
-                        l0_N_tiling_factor,
-                        l0_K_tiling_factor,
-                    ) in [(1, 1, 1)]:
-                        mapping = self.Mapping(
-                            l2_tile_M,
-                            l2_tile_N,
-                            l2_tile_K,
-                            is_l2_double_buffering,
-                            l1_tile_M,
-                            l1_tile_N,
-                            l1_tile_K,
-                            l2_loop_order,
-                            l1_loop_order,
-                            l0_M_tiling_factor,
-                            l0_N_tiling_factor,
-                            l0_K_tiling_factor,
-                        )
-                        # mapping.display()
-                        # start=time.time()
-                        cycle_count = self.simulate(
-                            self.computational_graph,
-                            mapping,
-                            pcb_module,
-                        )
-                        # end=time.time()
-                        # print(f'simulation time: {end-start}')
-                        if cycle_count < min_cycle_count:
-                            min_cycle_count = cycle_count
-                            best_mapping = mapping
         else:
             raise ValueError(f"compile_mode {compile_mode} not supported")
         # 记录全局最优结果
@@ -745,7 +518,7 @@ class Matmul(Operator): # MNK指M*K的矩阵与K*N的矩阵相乘，输出M*N的
         self.best_latency = min_cycle_count / pcb_module.compute_module.clock_freq
         self.latency = self.best_latency
         # self.best_mapping.display()
-        return self.latency
+        return self.best_cycle_count
 
     def simulate(
         self,
@@ -755,20 +528,34 @@ class Matmul(Operator): # MNK指M*K的矩阵与K*N的矩阵相乘，输出M*N的
     ) -> int: # 注解，表明返回值是int
         if self.look_up_table is None: # None表示表格未加载，需要初始化读取表格
             # 懒加载脉动阵列查找表
-            self.look_up_table = pd.read_csv(
-                f"./systolic_array_model/look_up_table_{pcb_module.compute_module.core.systolic_array.array_height}_{pcb_module.compute_module.core.systolic_array.array_width}.csv",
-                header=None,
-                names=[
-                    "M",
-                    "N",
-                    "K",
-                    "ArrayHeight",
-                    "ArrayWidth",
-                    "Dataflow",
-                    "cycle_count",
-                    "util_rate",
-                ],
+            column_names = [
+                "M",
+                "N",
+                "K",
+                "ArrayHeight",
+                "ArrayWidth",
+                "Dataflow",
+                "cycle_count",
+                "util_rate",
+            ]
+            lut_path = (
+                f"./systolic_array_model/look_up_table_"
+                f"{pcb_module.compute_module.core.systolic_array.array_height}_"
+                f"{pcb_module.compute_module.core.systolic_array.array_width}.csv"
             )
+            if not os.path.exists(lut_path):
+                os.makedirs(os.path.dirname(lut_path), exist_ok=True)
+                pd.DataFrame(columns=column_names).to_csv(
+                    lut_path, header=False, index=False
+                )
+            try:
+                self.look_up_table = pd.read_csv(
+                    lut_path,
+                    header=None,
+                    names=column_names,
+                )
+            except pd.errors.EmptyDataError:
+                self.look_up_table = pd.DataFrame(columns=column_names)
             self.look_up_table.drop_duplicates(
                 inplace=True,
                 subset=["M", "N", "K", "ArrayHeight", "ArrayWidth", "Dataflow"],
@@ -904,7 +691,8 @@ class Matmul(Operator): # MNK指M*K的矩阵与K*N的矩阵相乘，输出M*N的
 
         total_cycle_count = 0
         total_cycle_count += (
-            l2_tiles[0, 0, 0].M_K_io_cycle_count + l2_tiles[0, 0, 0].K_N_io_cycle_count
+            l2_tiles[0, 0, 0].M_K_read_cycle_count
+            + l2_tiles[0, 0, 0].K_N_read_cycle_count
         ) # 读取第一个矩阵的第一个tile和第二个矩阵的第一个tile
 
         previous_m = 0 # 先前l2tiles中元素的index
@@ -925,15 +713,15 @@ class Matmul(Operator): # MNK指M*K的矩阵与K*N的矩阵相乘，输出M*N的
 
             # current tile read latency
             if m == previous_m and k == previous_k:
-                current_tile_read_cycle_count = l2_tile.K_N_io_cycle_count
+                current_tile_read_cycle_count = l2_tile.K_N_read_cycle_count
             elif n == previous_n and k == previous_k:
-                current_tile_read_cycle_count = l2_tile.M_K_io_cycle_count
+                current_tile_read_cycle_count = l2_tile.M_K_read_cycle_count
             else:
                 current_tile_read_cycle_count = (
-                    l2_tile.M_K_io_cycle_count + l2_tile.K_N_io_cycle_count
+                    l2_tile.M_K_read_cycle_count + l2_tile.K_N_read_cycle_count
                 )
             if k > 0 and not (m == previous_m and n == previous_n): # not后确保只在切换输出矩阵mn tile的位置时才输出结果，把mn tile中间数据暂存于主存，mn不切换时只是累加。k>0要求只有非第一次计算该mn块时才从主存中读取中间数据
-                current_tile_read_cycle_count += l2_tile.M_N_io_cycle_count
+                current_tile_read_cycle_count += l2_tile.M_N_read_cycle_count
             # previous tile compute latency
             previous_tile_compute_cycle_count = previous_l2_tile.compute_cycle_count
             if previous_k > 0:  # previous_k>0要求在非第一轮时要对mn块与主存中的中间数据进行按元素求和、读、写（三个部分的cycle）。原文是if k>0:
@@ -944,7 +732,7 @@ class Matmul(Operator): # MNK指M*K的矩阵与K*N的矩阵相乘，输出M*N的
             if m == previous_m and n == previous_n:
                 previous_tile_write_cycle_count = 0
             else:
-                previous_tile_write_cycle_count = previous_l2_tile.M_N_io_cycle_count
+                previous_tile_write_cycle_count = previous_l2_tile.M_N_write_cycle_count
 
             # read current tile, compute previous tile, write previous tile
             if mapping.is_l2_double_buffering:  # pipelined
@@ -967,7 +755,7 @@ class Matmul(Operator): # MNK指M*K的矩阵与K*N的矩阵相乘，输出M*N的
 
         # compute and write last tile
         total_cycle_count += (
-            l2_tiles[-1, -1, -1].M_N_io_cycle_count
+            l2_tiles[-1, -1, -1].M_N_write_cycle_count
             + l2_tiles[-1, -1, -1].compute_cycle_count
         )
 
@@ -996,29 +784,60 @@ class Matmul(Operator): # MNK指M*K的矩阵与K*N的矩阵相乘，输出M*N的
             self.K = K
             self.K_reduction_cycle_count = ceil(
                 M * N / pcb_module.compute_module.total_vector_flops_per_cycle
-            ) + 2 * ceil(
-                M
-                * N
-                * data_type.word_size
-                / pcb_module.compute_module.l2_bandwidth_per_cycle
-            )
+            ) # K规约也是完成于l1，因此此处没有l2与主存的io时间
             self.K_reduction_io_count = 2 * M * N * data_type.word_size
-            self.M_K_io_cycle_count = self.simulate_l2_tile_io_cycle_count(
-                M, K, data_type, pcb_module
-            )
-            self.K_N_io_cycle_count = self.simulate_l2_tile_io_cycle_count(
-                K, N, data_type, pcb_module
-            )
-            self.M_N_io_cycle_count = self.simulate_l2_tile_io_cycle_count(
-                M, N, data_type, pcb_module
-            )
+            self.M_K_read_cycle_count = self.simulate_l2_tile_read_cycle_count(
+                M, K, data_type, pcb_module, mapping.matmul_type
+            ) # QK阶段读，SV不读
+            self.K_N_read_cycle_count = self.simulate_l2_tile_io_cycle_count(
+                K, N, data_type, pcb_module, mapping.matmul_type
+            ) # QK和SV都读，所以此处用simulate_l2_tile_io_cycle_count而不是simulate_l2_tile_read_cycle_count
+            self.M_N_read_cycle_count = 0 # SV和QK都不读，因为MN tile 不应该从主存中读取，只能从l1中读，但是此处计算的是l2与主存的io，因此为0
+            self.M_N_write_cycle_count = self.simulate_l2_tile_write_cycle_count(
+                M, N, data_type, pcb_module, mapping.matmul_type
+            ) # QK不写，SV写
             self.compute_cycle_count = self.simulate_l2_tile_compute_cycle_count(
                 M, N, K, data_type, mapping, pcb_module, look_up_table
             )
 
-        def simulate_l2_tile_io_cycle_count(
-            self, M: int, N: int, data_type: DataType, chiplet_module: Device
+        def simulate_l2_tile_read_cycle_count(
+            self,
+            M: int,
+            N: int,
+            data_type: DataType,
+            chiplet_module: Device,
+            matmul_type: MatmulType,
         ): # l2 io是指片外内存（dram/hbm）到片内共享缓存（sram）之间的io
+            if matmul_type == "SV":
+                return 0
+            return self.simulate_l2_tile_io_cycle_count(
+                M, N, data_type, chiplet_module, matmul_type
+            )
+        
+        def simulate_l2_tile_write_cycle_count(
+            self,
+            M: int,
+            N: int,
+            data_type: DataType,
+            chiplet_module: Device,
+            matmul_type: MatmulType,
+        ): # l2 io是指片外内存（dram/hbm）到片内共享缓存（sram）之间的io
+            if matmul_type == "QK":
+                return 0
+            return self.simulate_l2_tile_io_cycle_count(
+                M, N, data_type, chiplet_module, matmul_type
+            )
+
+        def simulate_l2_tile_io_cycle_count(
+            self,
+            M: int,
+            N: int,
+            data_type: DataType,
+            chiplet_module: Device,
+            matmul_type: MatmulType,
+        ): # l2 io是指片外内存（dram/hbm）到片内共享缓存（sram）之间的io
+            if matmul_type not in ("QK", "SV"):
+                raise ValueError(f"Unsupported matmul_type: {matmul_type}")
             return ceil(
                 M
                 * N
@@ -1254,17 +1073,27 @@ class Matmul(Operator): # MNK指M*K的矩阵与K*N的矩阵相乘，输出M*N的
                     )
                     * M_N_tile_size
                 )
-                previous_batch_M_N_write_count = np.sum(
-                    (previous_batch_Write_M_N * (~current_batch_Read_M_N))
-                    * M_N_tile_size
-                )
+                if mapping.matmul_type == "QK":
+                    previous_batch_M_N_write_count = 0 # Qk不需要写MN
+                elif mapping.matmul_type == "SV":
+                    previous_batch_M_N_write_count = np.sum(
+                        (previous_batch_Write_M_N * (~current_batch_Read_M_N))
+                        * M_N_tile_size
+                    ) # SV需要写MN
+                else:
+                    raise ValueError(f"Unsupported matmul_type: {mapping.matmul_type}")
 
                 # read current batch while compute and write previous batch. 先统计读写元素量，再按字节宽度和 L2 带宽折算成 IO 周期，供后面的流水重叠公式使用
-                current_batch_read_count = (
-                    current_batch_M_K_read_count
-                    + current_batch_K_N_read_count
-                    + current_batch_M_N_read_count
-                )
+                if mapping.matmul_type == "QK":
+                    current_batch_read_count = (
+                        current_batch_M_K_read_count + current_batch_K_N_read_count
+                    ) # QK只读MK和KN
+                elif mapping.matmul_type == "SV":
+                    current_batch_read_count = current_batch_K_N_read_count # SV只读KN
+                else:
+                    raise ValueError(
+                        f"Unsupported matmul_type: {mapping.matmul_type}"
+                    )
                 current_batch_read_cycle_count = ceil(
                     current_batch_read_count
                     * chiplet_module.compute_module.core.systolic_array.input_word_size
@@ -1293,10 +1122,18 @@ class Matmul(Operator): # MNK指M*K的矩阵与K*N的矩阵相乘，输出M*N的
                 active_l1_tile_list = []
 
             # last batch's compute and write. 最后一批的计算和写回通常无法和下一批的读取重叠，所以单独算cycle count
-            total_cycle_count += previous_batch_compute_cycle_count + ceil(
-                np.sum(previous_batch_Write_M_N * M_N_tile_size)
-                * data_type.word_size
-                / chiplet_module.compute_module.l2_bandwidth_per_cycle
+            if mapping.matmul_type == "QK":
+                last_batch_write_cycle_count = 0 # QK不需要写
+            elif mapping.matmul_type == "SV":
+                last_batch_write_cycle_count = ceil(
+                    np.sum(previous_batch_Write_M_N * M_N_tile_size)
+                    * data_type.word_size
+                    / chiplet_module.compute_module.l2_bandwidth_per_cycle
+                ) # Sv需要写
+            else:
+                raise ValueError(f"Unsupported matmul_type: {mapping.matmul_type}")
+            total_cycle_count += (
+                previous_batch_compute_cycle_count + last_batch_write_cycle_count
             )
 
             return total_cycle_count
@@ -1491,70 +1328,257 @@ class Matmul(Operator): # MNK指M*K的矩阵与K*N的矩阵相乘，输出M*N的
         # 将阵列周期换算为核心周期
         return ceil(cycle_count / mac_per_clock)
 
-    def run_on_gpu(
+class Softmax(Operator):
+    def __init__(self, M: int, N: int, data_type: DataType):
+        super().__init__(0, 0, 0, 0, data_type)
+        self.M = M
+        self.N = N
+        self.output_shape = [self.M, self.N]
+        self.computational_graph = self.ComputationalGraph(
+            self.M, self.N, self.data_type
+        )
+
+    def print_latency(self):
+        print(f"{self.output_shape}, {self.latency_on_gpu*1e6}us")
+
+    class ComputationalGraph:
+        def __init__(self, M: int, N: int, data_type: DataType):
+            self.M = M
+            self.N = N
+            self.data_type = data_type
+
+    class Mapping:
+        def __init__(
+            self,
+            l2_tile_M: int,
+            l2_tile_N: int,
+            is_l2_double_buffering: bool,
+            l1_tile_M: int,
+            l1_tile_N: int,
+            is_l1_double_buffering: bool = False,
+        ):
+            self.l2_tile_M = l2_tile_M
+            self.l2_tile_N = l2_tile_N
+            self.is_l2_double_buffering = is_l2_double_buffering
+            self.l1_tile_M = l1_tile_M
+            self.l1_tile_N = l1_tile_N
+            self.is_l1_double_buffering = is_l1_double_buffering
+
+        def display(self):
+            print("-" * 20)
+            print(
+                f"l2_tile_M: {self.l2_tile_M}, is_l2_double_buffering: {self.is_l2_double_buffering}, l1_tile_M: {self.l1_tile_M}, l1_tile_N: {self.l1_tile_N}, is_l1_double_buffering: {self.is_l1_double_buffering}"
+            )
+    
+    def compile_and_simulate(self, pcb_module: Device, compile_mode=None):
+        self.computational_graph.data_type = pcb_module.compute_module.core.vector_unit.data_type
+        min_cycle_count = float("inf")
+        best_mapping = None
+        # 将输入张量映射为 M * N 的二维矩阵，其中每行都做softmax，一共做M次softmax
+        M = self.computational_graph.M
+        N = self.computational_graph.N
+        data_type = self.computational_graph.data_type
+        l2_tile_N = N
+        l2_tile_M = (
+            pcb_module.compute_module.l2_size // (l2_tile_N * data_type.word_size)
+        ) # l2能放下的矩阵的行数，即单次缓存l2可以做的softmax的次数
+        l2_tile_M = max(1, min(l2_tile_M, M))
+        is_l2_double_buffering = False
+        for l1_N_tiling_factor in [1, 2, 4, 8, 16, 32]:
+            l1_tile_N = ceil(l2_tile_N / l1_N_tiling_factor)
+            for l1_tile_M in [1, 2, 4, 8, 16, 32, 64, 128, 256]:
+                for is_l1_double_buffering in [True, False]:
+                    if is_l1_double_buffering:
+                        if (
+                            l1_tile_M * l1_tile_N * data_type.word_size
+                            > pcb_module.compute_module.core.SRAM_size // 2
+                        ):
+                            continue
+                    else:
+                        if (
+                            l1_tile_M * l1_tile_N * data_type.word_size
+                            > pcb_module.compute_module.core.SRAM_size
+                        ):
+                            continue
+                    mapping = self.Mapping(
+                        l2_tile_M,
+                        l2_tile_N,
+                        is_l2_double_buffering,
+                        l1_tile_M,
+                        l1_tile_N,
+                        is_l1_double_buffering,
+                    )
+                    cycle_count = self.simulate(
+                        self.computational_graph, mapping, pcb_module
+                    )
+                    if cycle_count < min_cycle_count:
+                        min_cycle_count = cycle_count
+                        best_mapping = mapping
+        self.best_mapping = best_mapping
+        self.best_cycle_count = min_cycle_count
+        self.best_latency = min_cycle_count / pcb_module.compute_module.clock_freq
+        self.latency = self.best_latency
+        # self.best_mapping.display()
+        return self.best_cycle_count
+
+    def simulate(
         self,
-    ):
-        # 实测GPU matmul延迟中位数
-        # import subprocess
-        # subprocess.run(['nvidia-smi', '-q', '–d', 'CLOCK'])
-        input1 = torch.randn(
-            self.computational_graph.M,
-            self.computational_graph.K,
-            dtype=torch.bfloat16,
-            device="cuda:0",
-        )
-        input2 = torch.randn(
-            self.computational_graph.K,
-            self.computational_graph.N,
-            dtype=torch.bfloat16,
-            device="cuda:0",
-        )
-        latencies = []
-        input1_dummy = torch.ones(4096, 4096).cuda()
-        input2_dummy = torch.ones(4096, 4096).cuda()
-        # warmup
-        for _ in range(3):
-            torch.matmul(input1_dummy, input2_dummy)
-            torch.cuda.synchronize()
-            time.sleep(1)
-        for _ in range(self.iterations):
-            # x = torch.matmul(input1_dummy, input2_dummy)  # flush the cache
-            # torch.cuda.synchronize()
-            start = time.time()
-            output = torch.matmul(input1, input2)
-            torch.cuda.synchronize()
-            end = time.time()
-            assert list(output.shape) == [
-                self.computational_graph.M,
-                self.computational_graph.N,
-            ]
-            latencies.append(end - start)
-            # time.sleep(1)
+        computational_graph: ComputationalGraph,
+        mapping: Mapping,
+        pcb_module: Device,
+    ) -> int:
+        M = computational_graph.M
+        N = computational_graph.N
+        data_type = computational_graph.data_type
+        l2_tile_M = mapping.l2_tile_M
 
-        self.latency_on_gpu = (
-            statistics.median(latencies)
-            # min(latencies)
-            # - self.gpu_kernel_launch_overhead()
-            # - 4e-5
-            # min(latencies) - 8e-6
-        )  # GPU launch kernel overhead and PyTorch overhead
-        return self.latency_on_gpu
+        if mapping.is_l2_double_buffering:
+            assert (
+                l2_tile_M * N * data_type.word_size * 2
+                <= pcb_module.compute_module.l2_size
+            )
+        else:
+            assert (
+                l2_tile_M * N * data_type.word_size <= pcb_module.compute_module.l2_size
+            )
 
-    @staticmethod
-    def gpu_kernel_launch_overhead():
-        # 实测单kernel启动开销
-        size = 1
-        latencies = []
-        for _ in range(50):
-            a = torch.randn(size, size, device="cuda")
-            b = torch.randn(size, size, device="cuda")
-            torch.cuda.synchronize()
-            start = time.time()
-            c = torch.matmul(a, b)
-            torch.cuda.synchronize()
-            end = time.time()
-            latencies.append(end - start)
-        avg_overhead = statistics.median(latencies)
-        print("GPU kernel launch overhead: ", avg_overhead * 1e3, "ms")
-        print(latencies)
-        return avg_overhead
+        M_l2_t = M // l2_tile_M
+        M_remain = M % l2_tile_M
+
+        l2_tiles = np.empty([ceil(M / l2_tile_M)], dtype=self.L2TileSimulator) # l2_tiles用来存放每个l2 tile的模拟结果的数组
+
+        if M_l2_t != 0:
+            l2_tiles[:M_l2_t] = self.L2TileSimulator(
+                l2_tile_M,
+                N,
+                data_type,
+                mapping,
+                pcb_module,
+            )
+        if M_remain != 0:
+            l2_tiles[-1] = self.L2TileSimulator(
+                M_remain,
+                N,
+                data_type,
+                mapping,
+                pcb_module,
+            )
+
+        total_cycle_count = 0
+        l2_tile_count = ceil(M / l2_tile_M)
+        for m in range(l2_tile_count):
+            total_cycle_count += l2_tiles[m].compute_cycle_count # 只有计算没有io
+        return ceil(total_cycle_count)
+
+    class L2TileSimulator:
+        def __init__(
+            self,
+            M: int,
+            N: int,
+            data_type: DataType,
+            mapping: "Softmax.Mapping",
+            pcb_module: Device,
+        ): # 注意，此处的M，N是指这个L2 tile的shape，而不是整个输入的shape，这里的M，N只是变量名与之前的computational_graph.M、computational_graph.N重复而已
+            self.M = M
+            self.N = N
+            self.compute_cycle_count = self.simulate_l2_tile_compute_cycle_count(
+                M, N, data_type, mapping, pcb_module
+            )
+
+        def simulate_l2_tile_compute_cycle_count(
+            self,
+            M: int,
+            N: int,
+            data_type: DataType,
+            mapping: "Softmax.Mapping",
+            pcb_module: Device,
+        ):
+            l1_tile_M = mapping.l1_tile_M
+            l1_tile_N = mapping.l1_tile_N
+
+            l1_tile = Softmax.L1TileSimulator(
+                l1_tile_M,
+                l1_tile_N,
+                data_type,
+                mapping,
+                pcb_module,
+            )
+            l1_tile_count = ceil(M / l1_tile_M) * ceil(N / l1_tile_N)
+            l1_tile_cycle_count = l1_tile.compute_cycle_count  # 只有计算没有io
+            reduction_round_count = ceil(log2(ceil(N / l1_tile_N)))
+            total_cycle_count = ceil(
+                l1_tile_count / pcb_module.compute_module.core_count
+            ) * (
+                l1_tile_cycle_count
+                + reduction_round_count * l1_tile.reduction_cycle_count
+            )
+            return total_cycle_count
+
+
+    class L1TileSimulator:
+        def __init__(
+            self,
+            M: int,
+            N: int,
+            data_type: DataType,
+            mapping: "Softmax.Mapping",
+            pcb_module: Device,
+        ): # 注意，与上面相同，此处的M，N是指这个L1 tile的shape
+            self.M = M
+            self.N = N
+            self.flops_per_exp = (
+                pcb_module.compute_module.core.vector_unit.flops_per_exp
+            )
+
+            self.compute_cycle_count = self.simulate_l1_tile_compute_cycle_count(
+                M, N, data_type, mapping, pcb_module
+            )
+
+            self.reduction_cycle_count = (
+                M
+                * N
+                * (self.flops_per_exp + 2)
+                / pcb_module.compute_module.core.vector_unit.total_vector_flops_per_cycle
+            )
+
+
+        def simulate_l1_tile_compute_cycle_count(
+            self,
+            M: int,
+            N: int,
+            data_type: DataType,
+            mapping: "Softmax.Mapping",
+            pcb_module: Device,
+        ):
+            # online softmax
+            total_flop_count = M * N * (self.flops_per_exp * 3 + 7) # 经验公式，粗略估计
+            return ceil(
+                total_flop_count
+                / pcb_module.compute_module.core.vector_unit.total_vector_flops_per_cycle
+            )
+
+def main() -> int:
+    from hardware_model.device import device_dict
+
+    M, K, N = 128, 256, 512
+    data_type = data_type_dict["fp16"]
+    pcb_module = device_dict["A100_80GB_fp16"]
+
+    matmul = Matmul(M, K, N, data_type, "QK")
+    assert matmul.output_shape == [M, N], f"unexpected output shape: {matmul.output_shape}"
+    assert matmul.flop_count == 2 * M * K * N
+    assert matmul.io_count == M * K + K * N + M * N
+
+    simulate_cycle_count = matmul.compile_and_simulate(pcb_module)
+
+    print("Matmul smoke test passed")
+    print(f"M={M}, K={K}, N={N}, dtype={data_type.name}")
+    print(f"output_shape={matmul.output_shape}")
+    print(f"flops={matmul.flop_count}, io_count={matmul.io_count}")
+    print(f"simulate_cycle_count={simulate_cycle_count}")
+    print(f"simulate_latency={matmul.best_latency:.6e}s")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

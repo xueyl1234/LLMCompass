@@ -41,7 +41,7 @@ class AllReduceMultiPCB(CommunicationPrimitive):
         max_payload_size = interconnect_module.link_module.max_payload_size
         link_count_per_device = interconnect_module.link_count_per_device
         data_size = size(self.input_shape) * self.data_type.word_size
-        if interconnect_module.topology == TopologyType.FC:
+        if interconnect_module.topology == TopologyType.FC: # 全互连
             edge_bandwidth_per_direction = (
                 link_bandwidth_per_direction
                 * link_count_per_device
@@ -61,17 +61,22 @@ class AllReduceMultiPCB(CommunicationPrimitive):
             )
             # stage 1: ring reduce
             latency = (
+                # 单跳固定时延（链路启动/握手等）
                 edge_latency
+                # 有效字节数（payload+packet header）除以双向带宽得到传输时延
                 + effective_data_size_per_device / edge_bandwidth_both_direction
+                # reduce阶段需要经过 (N-1) 轮
             ) * (device_count - 1)
             # stage 2: broadcast
+            # 广播阶段传输时延（单向）
             latency += effective_data_size_per_device / edge_bandwidth_per_direction
+            # 设备内部链路开销（如片上/板内数据搬运）；默认 internal bandwidth=inf 时该项为 0
             latency += (
                 data_size / interconnect_module.internal_link_bandwidth_per_direction
             )
             self.latency = latency
             return latency
-        elif interconnect_module.topology == TopologyType.RING:
+        elif interconnect_module.topology == TopologyType.RING: # 环形互连
             edge_bandwidth = link_bandwidth_per_direction * link_count_per_device
             edge_latency = link_latency
             data_size_per_device = data_size / device_count
@@ -116,4 +121,3 @@ class Broadcast:
     def __call__(self, src: int, tensor: Tensor):
         self.src = src
         self.tensor = tensor
-

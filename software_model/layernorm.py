@@ -75,7 +75,7 @@ class LayerNorm(Operator):
     def compile_and_simulate(self, pcb_module: Device, compile_mode: str):
         self.computational_graph.data_type = (
             pcb_module.compute_module.core.vector_unit.data_type
-        )
+        ) # 处理M * N的矩阵，对行进行norm，norm M次
         min_cycle_count = float("inf")
         best_mapping = None
         M = self.computational_graph.M
@@ -84,7 +84,7 @@ class LayerNorm(Operator):
         l2_tile_N = N
         l2_tile_M = (
             pcb_module.compute_module.l2_size // (l2_tile_N * data_type.word_size) // 2
-        )
+        ) # 强制l2双缓冲，即l2只能放下单次计算一半的矩阵，这样在计算一半l2 tile的时候，另一半l2 tile可以并行地进行数据传输，隐藏l2的io时间
         l2_tile_M = min(l2_tile_M, M)
         if compile_mode == "heuristic-GPU" or compile_mode == "heuristic-our-throughput":
             # if N <= 1024:
@@ -93,15 +93,15 @@ class LayerNorm(Operator):
                 pcb_module.compute_module.core.SRAM_size
                 // (l1_tile_N * data_type.word_size)
                 // 2
-            )
-            while l1_tile_M < pcb_module.compute_module.core.vector_unit.vector_count:
+            ) # 初始设定l1双缓冲，即l1只能放下单次计算一半的矩阵，这样在计算一半l1 tile的时候，另一半l1 tile可以并行地进行数据传输，隐藏l1的io时间
+            while l1_tile_M < pcb_module.compute_module.core.vector_unit.vector_count: # 如果l1 tile的行数小于vector count，说明计算资源没有被充分利用，继续减小l1 tile N，增加l1 tile M，直到l1 tile的行数大于等于vector count
                 l1_tile_N = l1_tile_N // 2
                 l1_tile_M = (
                     pcb_module.compute_module.core.SRAM_size
                     // (l1_tile_N * data_type.word_size)
                     // 2
                 )
-            l1_tile_M = min(l1_tile_M, l2_tile_M)
+            l1_tile_M = min(l1_tile_M, l2_tile_M) # l1 tile的行数不能大于l2 tile的行数
         elif compile_mode == "heuristic-TPU":
             l1_tile_N = N
             l1_tile_M = pcb_module.compute_module.core.SRAM_size // (
@@ -229,7 +229,7 @@ class LayerNorm(Operator):
             ) * (
                 l1_tile_cycle_count
                 + (ceil(N / l1_tile_N) - 1) * (l1_tile.reduction_cycle_count)
-            )
+            ) # 轮次 × 每轮估计开销
             return total_cycle_count
 
     class L1TileSimulator:
@@ -260,10 +260,7 @@ class LayerNorm(Operator):
                 * N
                 * data_type.word_size
                 * 2
-                / (
-                    pcb_module.compute_module.l2_bandwidth_per_cycle
-                    / pcb_module.compute_module.core_count
-                )
+                / (pcb_module.compute_module.l2_bandwidth_per_cycle / pcb_module.compute_module.core_count)
             )
 
         def simulate_l1_tile_io_cycle_count(
@@ -299,11 +296,11 @@ class LayerNorm(Operator):
                 N_per_vector_lane
                 * M_per_vector_lane
                 / pcb_module.compute_module.core.vector_unit.flops_per_cycle
-            )
+            ) # 每个lane计算它负责的元素数量除以每周期每lane的flop数，得到计算mean的周期数
             # the whole vector reduce to one mean
             total_cycle_count += log2(
                 pcb_module.compute_module.core.vector_unit.vector_width
-            )
+            ) # 每个lane计算出一个partial mean后，还需要log2(vector_width)轮reduction才能得到最终的mean，每轮reduction的周期数可以忽略不计，因为只是几个vector的简单加法
             # each lane computes it own variance
             total_cycle_count += (
                 ceil(
@@ -312,11 +309,11 @@ class LayerNorm(Operator):
                     / pcb_module.compute_module.core.vector_unit.flops_per_cycle
                 )
                 * 2
-            )
+            ) # 计算variance比计算mean多了一倍的flop，因为需要先减去mean再平方
             # the whole vector reduce to one variance
             total_cycle_count += log2(
                 pcb_module.compute_module.core.vector_unit.vector_width
-            )
+            ) # 每个lane计算出一个partial variance后，还需要log2(vector_width)轮reduction才能得到最终的variance，每轮reduction的周期数可以忽略不计，因为只是几个vector的简单加法
             # calculate normalized output
             total_cycle_count += (
                 ceil(
@@ -325,7 +322,7 @@ class LayerNorm(Operator):
                     / pcb_module.compute_module.core.vector_unit.flops_per_cycle
                 )
                 * 4
-            )  # division is heavy
+            )  # division is heavy. 计算normalized output比计算mean多了4倍的flop，因为需要先减去mean再除以sqrt(variance+eps)还要乘以gamma再加上beta
 
             return total_cycle_count
 
